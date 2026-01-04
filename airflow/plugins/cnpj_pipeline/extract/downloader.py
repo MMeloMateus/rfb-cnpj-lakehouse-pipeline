@@ -68,7 +68,7 @@ def download_files(url_file: str, path_destiny: str, **context):
             with requests.get(
                 file_url,
                 stream=True,
-                timeout=(10, 900)
+                timeout=(30, 3600)
             ) as r:
                 r.raise_for_status()
 
