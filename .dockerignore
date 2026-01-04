@@ -1,0 +1,14 @@
+airflow/logs
+airflow/tmp
+airflow/*.db
+airflow/*.cfg
+airflow/*.pid
+airflow/*.txt
+airflow/webserver_config.py
+.idea/
+__pycache__/
+*.pyc
+airflow/*.pyc
+.git/
+.gitignore
+.venv

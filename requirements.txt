@@ -1,0 +1,8 @@
+apache-airflow==2.9.1
+requests
+beautifulsoup4
+python-dotenv
+pendulum
+pandas
+pyarrow
+psycopg2-binary
