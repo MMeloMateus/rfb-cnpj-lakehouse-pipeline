@@ -48,7 +48,8 @@ cnpj-data-pipeline/
 │
 └── airflow/
     ├── dags/
-    │   └── pipeline_dag.py
+    │   ├── pipeline_csv_dag.py
+    │   └── pipeline_parquet_dag.py
     ├── logs/
     └── plugins/
         └── cnpj_pipeline
