@@ -12,7 +12,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="pipeline_parquet_dag",
+    dag_id="pipeline_csv_dag",
     schedule_interval=None,
     catchup=False,
     start_date=datetime(2025, 1, 1),
