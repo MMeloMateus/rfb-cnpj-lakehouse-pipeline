@@ -12,38 +12,40 @@ default_args = {
 }
 
 with DAG(
-    dag_id="pipeline_csv_dag",
+    dag_id="pipeline_parquet_dag",
     schedule_interval=None,
     catchup=False,
+    start_date=datetime(2025, 1, 1),
     default_args=default_args,
     max_active_runs=1,
-    params = { "origin_base_path": "/opt/project/data/raw",
-                    "output_dir": "/opt/project/data/bronze/parquet",
-                    "start_date": "2025-02",
-                    "end_date": "2025-02",
-                    "sep":";"
-                    }
+    params = { "zip_dir": "/opt/project/data/raw",
+                "csv_dir": "/opt/project/data/bronze/csv",
+                "parquet_dir": "/opt/project/data/bronze/parquet",
+                "start_date": "2025-02",
+                "end_date": "2025-02",
+                "sep":";"
+                }
 ) as dag:
     download = PythonOperator(
         task_id="download",
         python_callable=download_files_for_range,
         op_kwargs={
-            "origin_base_path": "{{ params.origin_base_path }}",
+            "origin_base_path": "{{ params.zip_dir }}",
             "start_date": "{{ params.start_date }}",
             "end_date": "{{ params.end_date }}",
         },
     )
 
-
-    uncompress_csv = PythonOperator(
-        task_id="uncompress_zip_range",
-        python_callable=uncompress_zip_file_range,
+    unzip_csv = PythonOperator(
+        task_id="unzip_to_csv",
+        python_callable= uncompress_zip_file_range,
         op_kwargs={
-            "origin_base_path": "{{ params.origin_base_path }}",
-            "output_dir": "{{ params.output_dir }}",
+            "origin_base_path": "{{ params.zip_dir }}",
+            "output_dir": "{{ params.csv_dir }}",
             "start_date": "{{ params.start_date }}",
             "end_date": "{{ params.end_date }}",
+            "sep": "{{ params.sep }}",
         },
     )
 
-    download >> uncompress_csv
+    download >> unzip_csv
