@@ -185,12 +185,21 @@ def uncompress_zip_file_range(
         raise RuntimeWarning("No zip files were processed in the given date range")
 
 
+def is_csv_like(filename: str) -> bool:
+    """
+    Detects CSV files even with unconventional extensions like:
+    .CSV, .CNAECSV, .EMPRESASCSV, etc.
+    """
+    name = filename.upper()
+    return name.endswith("CSV") or ".CSV" in name
+
+
 def unzip_zip_to_parquet(origin_path: str, output_dir: str, sep=";", **context) -> None:
     """
     Convert all .zip files from the source directory into parquet files.
     """
     # import pandas as pd
-    import pyarrow
+    import pyarrow as pa
     import pyarrow.csv as pv
     import pyarrow.parquet as pq
     import zipfile
@@ -208,15 +217,17 @@ def unzip_zip_to_parquet(origin_path: str, output_dir: str, sep=";", **context) 
             with ZipFile(file, "r") as zip_obj:
                 for member in zip_obj.infolist():
 
+                    if not is_csv_like(member.filename):
+                        continue
+
                     path = Path(member.filename)
                     name = path.name
 
                     steam = path.stem
-
                     suffix = path.suffix.lstrip(".")
                     base_suffix = suffix.removesuffix("CSV")
 
-                    parquet_path = output_dir / f"{steam}_{base_suffix}.parquet"
+                    parquet_path = output_dir / f"{steam}_{base_suffix}_{file.stem}.parquet"
 
                     if parquet_path.exists():
                         logger.info(
@@ -232,9 +243,10 @@ def unzip_zip_to_parquet(origin_path: str, output_dir: str, sep=";", **context) 
                     )
 
                     with zip_obj.open(member) as f:
-                        table = pv.read_csv(
+                        csv_file = pv.open_csv(
                             f,
                             read_options=pv.ReadOptions(
+                                block_size= 8 * 1024 * 1024,
                                 encoding="latin1"
                             ),
                             parse_options=pv.ParseOptions(
@@ -247,13 +259,28 @@ def unzip_zip_to_parquet(origin_path: str, output_dir: str, sep=";", **context) 
                             )
                         )
 
-                        pq.write_table(
-                            table,
-                            parquet_path,
-                            compression="snappy",
-                            write_statistics=True,
-                            use_dictionary=True
-                        )
+                        writer = None
+
+                        for batch in csv_file:
+                            table = pa.Table.from_batches([batch])
+
+                            if writer is None:
+                                writer = pq.ParquetWriter(
+                                    parquet_path,
+                                    table.schema,
+                                    compression="snappy",
+                                    write_statistics=True,
+                                    use_dictionary=True
+                                    )
+
+                            writer.write_table(table, row_group_size=10_000)
+
+                        if writer:
+                            writer.close()
+
+                        if writer is None:
+                            logger.warning("CSV vazio ou sem dados: %s", name)
+
 
         except zipfile.BadZipFile:
             logger.exception("Corrupted ZIP file skipped: %s", file)
@@ -304,10 +331,162 @@ def unzip_zip_to_parquet_range(
                 current.strftime("%Y-%m")
             )
 
+        except Exception as e:
+            logger.exception(
+                "Error processing the month %s: %s", current.strftime("%Y-%m"), e
+            )
+
+        current += relativedelta(months=1)
+
+    if processed_months == 0:
+        raise RuntimeWarning("No zip files were processed in the given date range")
+
+
+def list_archives_general(path: str,  **context) -> list[Path]:
+    """
+    Return a list files found in the given directory.
+    """
+    check_path(path)
+
+    path = Path(path)
+    zip_files = [
+        p for p in path.iterdir() if p.is_file()
+    ]
+
+    if not zip_files:
+        logger.warning("No .zip files found in directory: %s", path)
+        raise FileNotFoundError("No .zip file found in the directory")
+
+    logger.info("Found %d zip file(s) in %s", len(zip_files), path)
+    return zip_files
+
+
+def csv_to_parquet(origin_path: str, output_dir: str, sep=";", **context) -> None:
+    """
+    Convert CSV files from a directory into parquet files using PyArrow streaming.
+    """
+    import pyarrow as pa
+    import pyarrow.csv as pv
+    import pyarrow.parquet as pq
+
+    output_dir = Path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    files = list_archives_general(origin_path)
+
+    for file in files:
+        try:
+
+            logger.info("Processing CSV file: %s", file.name)
+
+            path = file
+            # path = Path(file)
+            stem = path.stem
+
+            parquet_path = output_dir / f"{stem}.parquet"
+
+            if parquet_path.exists():
+                logger.info(
+                    "Skipping parquet. Already exists: %s",
+                    parquet_path
+                )
+                continue
+
+            logger.info(
+                "Converting %s -> %s",
+                path.name,
+                parquet_path.name
+            )
+
+            csv_file = pv.open_csv(
+                file,
+                read_options=pv.ReadOptions(
+                    block_size=8 * 1024 * 1024,
+                    encoding="latin1"
+                ),
+                parse_options=pv.ParseOptions(
+                    delimiter=sep,
+                    quote_char='"'
+                ),
+                convert_options=pv.ConvertOptions(
+                    strings_can_be_null=True,
+                    null_values=["", "NULL"]
+                )
+            )
+
+            writer = None
+
+            for batch in csv_file:
+                table = pa.Table.from_batches([batch])
+
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        parquet_path,
+                        table.schema,
+                        compression="snappy",
+                        write_statistics=True,
+                        use_dictionary=True
+                    )
+
+                writer.write_table(table, row_group_size=10_000)
+
+            if writer:
+                writer.close()
+            else:
+                logger.warning("CSV vazio ou sem dados: %s", path.name)
+
+        except Exception:
+            logger.exception("Error processing CSV file: %s", file)
+
+
+def csv_to_parquet_range(
+    origin_base_path: str,
+    output_dir: str,
+    start_date: str,
+    end_date: str,
+    sep=";",
+    **context,
+) -> None:
+    """
+    Convert csv files to parquet month by month within a date range.
+    Supports folders in the format YYYY-MM.
+    """
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+    from pathlib import Path
+
+    start = datetime.strptime(start_date, "%Y-%m")
+    end = datetime.strptime(end_date, "%Y-%m")
+    current = start
+
+    processed_months = 0
+
+    while current <= end:
+        origin_month_path = Path(origin_base_path) / f"{current.year}-{current.month:02d}"
+        output_month_path = Path(output_dir) / f"{current.year}-{current.month:02d}"
+
+        logger.info(
+            "Processing month %s",
+            current.strftime("%Y-%m")
+        )
+
+        try:
+            csv_to_parquet(
+                origin_path=str(origin_month_path),
+                output_dir=str(output_month_path),
+                sep=sep,
+            )
+            processed_months += 1
+
+        except FileNotFoundError:
+            logger.warning(
+                "No files found for %s",
+                current.strftime("%Y-%m")
+            )
 
         except Exception as e:
             logger.exception(
-                "Erro ao processar o mês %s: %s", current.strftime("%Y-%m"), e
+                "Error processing the month %s: %s", current.strftime("%Y-%m"), e
             )
 
         current += relativedelta(months=1)

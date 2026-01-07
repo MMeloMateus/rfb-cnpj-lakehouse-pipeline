@@ -1,8 +1,12 @@
+import os
 import sys
+from pathlib import Path
 import logging
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
 handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter(
     "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
@@ -12,156 +16,484 @@ handler.setFormatter(formatter)
 if not logger.handlers:
     logger.addHandler(handler)
 
-def is_zip_valid(path: str) -> bool:
-    import zipfile
+
+def check_path(path: str) -> None:
+    """
+    Check if the path exists and is a directory.
+    """
+    path = Path(path)
+
+    if not path.exists():
+        logger.error("Path does not exist: %s", path)
+        raise FileNotFoundError(f"The path '{path}' does not exist")
+
+    if not path.is_dir():
+        logger.error("Path is not a directory: %s", path)
+        raise NotADirectoryError(f"The path '{path}' is not a directory")
+
+
+def read_csv_safe(binary_file, sep, encoding):
+    """
+    Reads a CSV file in a safe, error-tolerant way.
+    """
+    import pandas as pd
+    from pandas.errors import ParserError
+    from io import TextIOWrapper
 
     try:
-        with zipfile.ZipFile(path, "r") as z:
-            return z.testzip() is None
-    except Exception:
-        return False
+
+        return pd.read_csv(
+            binary_file,
+            sep=sep,
+            dtype=str,
+            low_memory=False,
+            encoding=encoding
+        )
+
+    except Exception as e:
+        logger.warning("Falha ao ler CSV normalmente (%s). Tentando com replace.", e)
+
+        binary_file.seek(0)
+
+        text_file = TextIOWrapper(
+            binary_file,
+            encoding=encoding,
+            errors="replace"
+        )
+
+        return pd.read_csv(
+            text_file,
+            sep=sep,
+            dtype=str,
+            low_memory=False,
+            on_bad_lines="skip"
+        )
 
 
-def download_files(url_file: str, path_destiny: str, **context):
+def list_archives(path: str,  **context) -> list[Path]:
     """
-    Download all .zip files from a given URL into path_destiny.
-    Safe for large files (1GB+), Docker and Airflow retries.
+    Return a list of .zip files found in the given directory.
     """
-    import os
-    from urllib.parse import urljoin
-    import requests
-    from bs4 import BeautifulSoup
-    import shutil
+    check_path(path)
 
-    os.makedirs(path_destiny, exist_ok=True)
-    logger.info("Starting HTML request: %s", url_file)
-
-    response_request = requests.get(url_file, timeout=30)
-    response_request.raise_for_status()
-
-    soup = BeautifulSoup(response_request.text, "html.parser")
-    archive_names = [
-        a["href"]
-        for a in soup.find_all("a")
-        if a.get("href", "").endswith(".zip")
+    path = Path(path)
+    zip_files = [
+        p for p in path.iterdir()
+        if p.is_file() and p.suffix.lower() == ".zip"
     ]
 
-    logger.info("Files found on page: %d", len(archive_names))
+    if not zip_files:
+        logger.warning("No .zip files found in directory: %s", path)
+        raise FileNotFoundError("No .zip file found in the directory")
 
-    for archive in archive_names:
-        local_path = os.path.join(path_destiny, archive)
+    logger.info("Found %d zip file(s) in %s", len(zip_files), path)
+    return zip_files
 
-        if os.path.exists(local_path) and is_zip_valid(local_path):
-            logger.info("File already exists and is valid: %s", archive)
-            continue
 
-        if os.path.exists(local_path):
-            logger.warning("Removing corrupted file: %s", archive)
-            os.remove(local_path)
+def uncompress_zip_file(origin_path: str, output_dir: str, **context) -> None:
+    """
+    Extract all .zip files from the source directory into the output directory.
+    """
+    import shutil
+    import zipfile
+    from zipfile import ZipFile
 
-        file_url = urljoin(url_file, archive)
-        tmp_path = local_path + ".part"
+    output_dir = Path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-        logger.info("Downloading file: %s -> %s", file_url, local_path)
+    zip_files = list_archives(origin_path)
 
+    for file in zip_files:
         try:
-            with requests.get(
-                file_url,
-                stream=True,
-                timeout=(30, 3600)
-            ) as r:
-                r.raise_for_status()
+            logger.info("Extracting zip file: %s", file)
 
-                expected_size = int(r.headers.get("Content-Length", 0))
+            with ZipFile(file, "r") as zip_obj:
+                for member in zip_obj.infolist():
 
-                with open(tmp_path, "wb") as f:
-                    shutil.copyfileobj(r.raw, f)
+                    name = Path(member.filename).name
+                    target_path = output_dir / name
 
-                downloaded = os.path.getsize(tmp_path)
+                    if member.is_dir():
+                        if target_path.exists():
+                            logger.info(
+                                "Skipping directory. Already exists: %s",
+                                target_path
+                            )
+                        else:
+                            target_path.mkdir()
+                        continue
 
-                if expected_size and downloaded != expected_size:
-                    raise IOError(
-                        f"Incomplete download for {archive}: "
-                        f"{downloaded} / {expected_size} bytes"
-                    )
+                    if target_path.exists():
+                        logger.info(
+                            "Skipping extraction. File already exists: %s",
+                            target_path
+                        )
+                        continue
 
-            os.rename(tmp_path, local_path)
+                    with zip_obj.open(member) as source, open(target_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
 
-            if not is_zip_valid(local_path):
-                raise IOError(f"ZIP corrupted after download: {archive}")
-
-            logger.info("Download completed successfully: %s", archive)
-
-        except Exception:
-            logger.exception("Failed to download file: %s", archive)
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            raise
+        except zipfile.BadZipFile:
+            logger.exception("Corrupted ZIP file skipped: %s", file)
 
 
-def download_files_for_period(
+def uncompress_zip_file_range(
     origin_base_path: str,
-    date: str,
-    **context):
-    """
-    Airflow PythonOperator callable.
-    Uses forced_date if provided, otherwise takes data_interval_start from context.
-    Date in format YYYY-MM
-    """
-    from datetime import datetime
-
-    import os
-    from urllib.parse import urljoin
-
-
-    base_url = os.getenv("RFB_BASE_URL")
-
-    if not base_url:
-        raise RuntimeError("RFB_BASE_URL not set in environment")
-
-    dt = datetime.strptime(date, "%Y-%m")
-    year = dt.year
-    month = dt.month
-
-    local_path = os.path.join(origin_base_path, f"{year}-{month:02d}")
-    url = urljoin(base_url.rstrip("/") + "/", f"{year}-{month:02d}/")
-
-    logger.info(
-        "Downloading period year=%s month=%s to %s from %s",
-        year,
-        month,
-        local_path,
-        url,
-    )
-
-    download_files(url, local_path, **context)
-
-
-def download_files_for_range(
-    origin_base_path:str,
+    output_dir: str,
     start_date: str,
     end_date: str,
-    **context ):
+    **context,
+) -> None:
     """
-    Download files for all months between start_date and end_date.
-    start_date and end_date must be in format YYYY-MM
+    Uncompress zip files month by month within a date range.
+    Supports folders in the format YYYY-MM.
     """
-    import pendulum
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
 
-    start = pendulum.from_format(start_date, "YYYY-MM").start_of("month")
-    end = pendulum.from_format(end_date, "YYYY-MM").start_of("month")
-
-
+    start = datetime.strptime(start_date, "%Y-%m")
+    end = datetime.strptime(end_date, "%Y-%m")
     current = start
 
+    processed_months = 0
     while current <= end:
-        date_format = current.format("YYYY-MM")
+        origin_month_path = Path(origin_base_path) / f"{current.year}-{current.month:02d}"
 
-        logger.info("Processing month: %s", date_format)
+        output_month_path = Path(output_dir) / f"{current.year}-{current.month:02d}"
 
-        download_files_for_period(
-            origin_base_path=origin_base_path,
-            date=date_format,
-            **context
+        logger.info(
+            "Processing month %s",
+            current.strftime("%Y-%m")
         )
-        current = current.add(months=1)
+
+        try:
+            uncompress_zip_file(
+                origin_path=str(origin_month_path),
+                output_dir=str(output_month_path),
+            )
+            processed_months += 1
+
+        except FileNotFoundError:
+            logger.warning(
+                "No files found for %s",
+                current.strftime("%Y-%m")
+            )
+
+        current += relativedelta(months=1)
+
+    if processed_months == 0:
+        raise RuntimeWarning("No zip files were processed in the given date range")
+
+
+def is_csv_like(filename: str) -> bool:
+    """
+    Detects CSV files even with unconventional extensions like:
+    .CSV, .CNAECSV, .EMPRESASCSV, etc.
+    """
+    name = filename.upper()
+    return name.endswith("CSV") or ".CSV" in name
+
+
+def unzip_zip_to_parquet(origin_path: str, output_dir: str, sep=";", **context) -> None:
+    """
+    Convert all .zip files from the source directory into parquet files.
+    """
+    # import pandas as pd
+    import pyarrow as pa
+    import pyarrow.csv as pv
+    import pyarrow.parquet as pq
+    import zipfile
+    from zipfile import ZipFile
+
+    output_dir = Path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    zip_files = list_archives(origin_path)
+
+    for file in zip_files:
+        try:
+            logger.info("Processing zip file: %s", file)
+
+            with ZipFile(file, "r") as zip_obj:
+                for member in zip_obj.infolist():
+
+                    if not is_csv_like(member.filename):
+                        continue
+
+                    path = Path(member.filename)
+                    name = path.name
+
+                    steam = path.stem
+                    suffix = path.suffix.lstrip(".")
+                    base_suffix = suffix.removesuffix("CSV")
+
+                    parquet_path = output_dir / f"{steam}_{base_suffix}_{file.stem}.parquet"
+
+                    if parquet_path.exists():
+                        logger.info(
+                            "Skipping parquet. Already exists: %s",
+                            parquet_path
+                        )
+                        continue
+
+                    logger.info(
+                        "Converting %s -> %s",
+                        name,
+                        parquet_path.name
+                    )
+
+                    with zip_obj.open(member) as f:
+                        csv_file = pv.open_csv(
+                            f,
+                            read_options=pv.ReadOptions(
+                                block_size= 8 * 1024 * 1024,
+                                encoding="latin1"
+                            ),
+                            parse_options=pv.ParseOptions(
+                                delimiter=sep,
+                                quote_char='"'
+                            ),
+                            convert_options=pv.ConvertOptions(
+                                strings_can_be_null=True,
+                                null_values=["", "NULL"]
+                            )
+                        )
+
+                        writer = None
+
+                        for batch in csv_file:
+                            table = pa.Table.from_batches([batch])
+
+                            if writer is None:
+                                writer = pq.ParquetWriter(
+                                    parquet_path,
+                                    table.schema,
+                                    compression="snappy",
+                                    write_statistics=True,
+                                    use_dictionary=True
+                                    )
+
+                            writer.write_table(table, row_group_size=10_000)
+
+                        if writer:
+                            writer.close()
+
+                        if writer is None:
+                            logger.warning("CSV vazio ou sem dados: %s", name)
+
+
+        except zipfile.BadZipFile:
+            logger.exception("Corrupted ZIP file skipped: %s", file)
+
+
+def unzip_zip_to_parquet_range(
+    origin_base_path: str,
+    output_dir: str,
+    start_date: str,
+    end_date: str,
+    sep=";",
+    **context,
+) -> None:
+    """
+    Convert zip files to parquet month by month within a date range.
+    Supports folders in the format YYYY-MM.
+    """
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+    from pathlib import Path
+
+    start = datetime.strptime(start_date, "%Y-%m")
+    end = datetime.strptime(end_date, "%Y-%m")
+    current = start
+
+    processed_months = 0
+
+    while current <= end:
+        origin_month_path = Path(origin_base_path) / f"{current.year}-{current.month:02d}"
+        output_month_path = Path(output_dir) / f"{current.year}-{current.month:02d}"
+
+        logger.info(
+            "Processing month %s",
+            current.strftime("%Y-%m")
+        )
+
+        try:
+            unzip_zip_to_parquet(
+                origin_path=str(origin_month_path),
+                output_dir=str(output_month_path),
+                sep=sep,
+            )
+            processed_months += 1
+
+        except FileNotFoundError:
+            logger.warning(
+                "No files found for %s",
+                current.strftime("%Y-%m")
+            )
+
+        except Exception as e:
+            logger.exception(
+                "Error processing the month %s: %s", current.strftime("%Y-%m"), e
+            )
+
+        current += relativedelta(months=1)
+
+    if processed_months == 0:
+        raise RuntimeWarning("No zip files were processed in the given date range")
+
+
+def list_archives_general(path: str,  **context) -> list[Path]:
+    """
+    Return a list files found in the given directory.
+    """
+    check_path(path)
+
+    path = Path(path)
+    zip_files = [
+        p for p in path.iterdir() if p.is_file()
+    ]
+
+    if not zip_files:
+        logger.warning("No .zip files found in directory: %s", path)
+        raise FileNotFoundError("No .zip file found in the directory")
+
+    logger.info("Found %d zip file(s) in %s", len(zip_files), path)
+    return zip_files
+
+
+def csv_to_parquet(origin_path: str, output_dir: str, sep=";", **context) -> None:
+    """
+    Convert CSV files from a directory into parquet files using PyArrow streaming.
+    """
+    import pyarrow as pa
+    import pyarrow.csv as pv
+    import pyarrow.parquet as pq
+
+    output_dir = Path(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    files = list_archives_general(origin_path)
+
+    for file in files:
+        try:
+
+            logger.info("Processing CSV file: %s", file.name)
+
+            path = Path(file.name)
+            name = path.name
+
+            steam = path.stem
+            suffix = path.suffix.lstrip(".")
+            # base_suffix = suffix.removesuffix("CSV")
+
+            parquet_path = output_dir / f"{steam}_{suffix}_{file.stem}.parquet"
+
+            if parquet_path.exists():
+                logger.info(
+                    "Skipping parquet. Already exists: %s",
+                    parquet_path
+                )
+                continue
+
+            logger.info(
+                "Converting %s -> %s",
+                path.name,
+                parquet_path.name
+            )
+
+            csv_file = pv.open_csv(
+                file,
+                read_options=pv.ReadOptions(
+                    block_size=8 * 1024 * 1024,
+                    encoding="latin1"
+                ),
+                parse_options=pv.ParseOptions(
+                    delimiter=sep,
+                    quote_char='"'
+                ),
+                convert_options=pv.ConvertOptions(
+                    strings_can_be_null=True,
+                    null_values=["", "NULL"]
+                )
+            )
+
+            writer = None
+
+            for batch in csv_file:
+                table = pa.Table.from_batches([batch])
+
+                if writer is None:
+                    writer = pq.ParquetWriter(
+                        parquet_path,
+                        table.schema,
+                        compression="snappy",
+                        write_statistics=True,
+                        use_dictionary=True
+                    )
+
+                writer.write_table(table, row_group_size=10_000)
+
+            if writer:
+                writer.close()
+            else:
+                logger.warning("CSV vazio ou sem dados: %s", path.name)
+
+        except Exception:
+            logger.exception("Error processing CSV file: %s", file)
+
+
+def csv_to_parquet_range(
+    origin_base_path: str,
+    output_dir: str,
+    start_date: str,
+    end_date: str,
+    sep=";",
+    **context,
+) -> None:
+    """
+    Convert csv files to parquet month by month within a date range.
+    Supports folders in the format YYYY-MM.
+    """
+    from datetime import datetime
+    from dateutil.relativedelta import relativedelta
+    from pathlib import Path
+
+    start = datetime.strptime(start_date, "%Y-%m")
+    end = datetime.strptime(end_date, "%Y-%m")
+    current = start
+
+    processed_months = 0
+
+    while current <= end:
+        origin_month_path = Path(origin_base_path) / f"{current.year}-{current.month:02d}"
+        output_month_path = Path(output_dir) / f"{current.year}-{current.month:02d}"
+
+        logger.info(
+            "Processing month %s",
+            current.strftime("%Y-%m")
+        )
+
+        try:
+            csv_to_parquet(
+                origin_path=str(origin_month_path),
+                output_dir=str(output_month_path),
+                sep=sep,
+            )
+            processed_months += 1
+
+        except FileNotFoundError:
+            logger.warning(
+                "No files found for %s",
+                current.strftime("%Y-%m")
+            )
+
+        except Exception as e:
+            logger.exception(
+                "Error processing the month %s: %s", current.strftime("%Y-%m"), e
+            )
+
+        current += relativedelta(months=1)
+
+    if processed_months == 0:
+        raise RuntimeWarning("No zip files were processed in the given date range")
+
