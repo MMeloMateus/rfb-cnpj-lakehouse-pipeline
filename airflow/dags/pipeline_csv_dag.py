@@ -1,5 +1,7 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from datetime import datetime
+
 
 from cnpj_pipeline.extract.downloader import download_files_for_range
 from cnpj_pipeline.extract.decompress import uncompress_zip_file_range
