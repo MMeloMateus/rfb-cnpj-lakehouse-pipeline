@@ -32,15 +32,14 @@ def download_files(url_file: str, path_destiny: str, **context):
     from urllib.parse import urljoin
     import requests
     from bs4 import BeautifulSoup
-    import shutil
 
     os.makedirs(path_destiny, exist_ok=True)
     logger.info("Starting HTML request: %s", url_file)
 
-    response_request = requests.get(url_file, timeout=30)
-    response_request.raise_for_status()
+    response = requests.get(url_file, timeout=30)
+    response.raise_for_status()
 
-    soup = BeautifulSoup(response_request.text, "html.parser")
+    soup = BeautifulSoup(response.text, "html.parser")
     archive_names = [
         a["href"]
         for a in soup.find_all("a")
@@ -50,6 +49,7 @@ def download_files(url_file: str, path_destiny: str, **context):
     logger.info("Files found on page: %d", len(archive_names))
 
     for archive in archive_names:
+        file_url = urljoin(url_file, archive)
         local_path = os.path.join(path_destiny, archive)
 
         if os.path.exists(local_path) and is_zip_valid(local_path):
@@ -59,9 +59,6 @@ def download_files(url_file: str, path_destiny: str, **context):
         if os.path.exists(local_path):
             logger.warning("Removing corrupted file: %s", archive)
             os.remove(local_path)
-
-        file_url = urljoin(url_file, archive)
-        tmp_path = local_path + ".part"
 
         logger.info("Downloading file: %s -> %s", file_url, local_path)
 
@@ -73,20 +70,10 @@ def download_files(url_file: str, path_destiny: str, **context):
             ) as r:
                 r.raise_for_status()
 
-                expected_size = int(r.headers.get("Content-Length", 0))
-
-                with open(tmp_path, "wb") as f:
-                    shutil.copyfileobj(r.raw, f)
-
-                downloaded = os.path.getsize(tmp_path)
-
-                if expected_size and downloaded != expected_size:
-                    raise IOError(
-                        f"Incomplete download for {archive}: "
-                        f"{downloaded} / {expected_size} bytes"
-                    )
-
-            os.rename(tmp_path, local_path)
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1MB
+                        if chunk:
+                            f.write(chunk)
 
             if not is_zip_valid(local_path):
                 raise IOError(f"ZIP corrupted after download: {archive}")
@@ -95,8 +82,8 @@ def download_files(url_file: str, path_destiny: str, **context):
 
         except Exception:
             logger.exception("Failed to download file: %s", archive)
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(local_path):
+                os.remove(local_path)
             raise
 
 
